@@ -18,17 +18,21 @@ Como rodar:
 
 import os
 
-from fastapi import FastAPI, Request
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import bot_engine
 import db
+import followup_semanal
 
 app = FastAPI(title="SeletoComex - IA de Followup de Importações")
 
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "seletocomex-dev-token")
+WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
+CRON_SECRET = os.environ.get("CRON_SECRET")
 
 
 class ChatIn(BaseModel):
@@ -79,6 +83,34 @@ def painel_stats():
 
 
 # -----------------------------------------------------------------------
+# Resumo semanal de follow-up (toda sexta) — gera RASCUNHOS por cliente
+# para a pessoa responsável revisar e enviar no grupo/conversa. A IA não
+# entra em grupos (a API do WhatsApp Business não permite isso), então
+# esse endpoint não manda nada pro cliente — só prepara os textos, que
+# aparecem em /painel para copiar e colar.
+#
+# Disparado por um agendador EXTERNO (ex: GitHub Actions), porque o
+# plano free do Render "dorme" e não confiável para agendar internamente.
+# -----------------------------------------------------------------------
+
+@app.post("/cron/followup-semanal")
+def cron_followup_semanal(x_cron_secret: str | None = Header(default=None)):
+    if not CRON_SECRET:
+        raise HTTPException(status_code=500, detail="CRON_SECRET não configurado no servidor")
+    if x_cron_secret != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="Token inválido")
+
+    rascunhos = followup_semanal.gerar_rascunhos()
+    lote = db.registrar_rascunhos_semanais(rascunhos)
+    return {"status": "ok", "lote": lote, "clientes": len(rascunhos)}
+
+
+@app.get("/painel/api/rascunhos-semanais")
+def painel_rascunhos_semanais():
+    return JSONResponse(db.listar_rascunhos_semanais_recentes())
+
+
+# -----------------------------------------------------------------------
 # Webhook no formato da Meta Cloud API (WhatsApp Business Platform)
 # -----------------------------------------------------------------------
 
@@ -118,21 +150,38 @@ async def receber_webhook(request: Request):
 
 def enviar_mensagem_whatsapp(telefone_destino: str, texto: str):
     """
-    STUB — em produção, aqui vai a chamada real à API do WhatsApp Business
-    (Meta Cloud API) para enviar a resposta de volta ao cliente.
+    Envia a resposta de volta ao cliente via WhatsApp Business Platform
+    (Meta Cloud API).
 
-        import requests
-        WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]
-        PHONE_NUMBER_ID = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
-        url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
-        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-        payload = {
-            "messaging_product": "whatsapp", "to": telefone_destino,
-            "type": "text", "text": {"body": texto},
-        }
-        requests.post(url, headers=headers, json=payload, timeout=10)
+    Requer as variáveis de ambiente WHATSAPP_TOKEN e
+    WHATSAPP_PHONE_NUMBER_ID configuradas (ex.: no Render, em
+    "Environment"). Sem elas, cai em modo de log (não envia de verdade) —
+    útil para testar pela interface de chat (/) sem gastar chamada de API.
     """
-    print(f"[WHATSAPP -> {telefone_destino}] {texto}")
+    token = os.environ.get("WHATSAPP_TOKEN")
+    phone_number_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+
+    if not token or not phone_number_id:
+        print(f"[WHATSAPP -> {telefone_destino}] (modo log, sem token configurado) {texto}")
+        return
+
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": telefone_destino,
+        "type": "text",
+        "text": {"body": texto},
+    }
+
+    try:
+        resposta = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resposta.status_code >= 400:
+            print(f"[WHATSAPP ERRO] status={resposta.status_code} body={resposta.text}")
+        else:
+            print(f"[WHATSAPP -> {telefone_destino}] enviado (status {resposta.status_code})")
+    except requests.RequestException as exc:
+        print(f"[WHATSAPP ERRO] falha ao enviar para {telefone_destino}: {exc}")
 
 
 # Serve a interface de chat e o painel (arquivos estáticos em /static)
