@@ -46,9 +46,21 @@ CREATE TABLE IF NOT EXISTS atendimentos (
     criado_em TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rascunhos_semanais (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lote TEXT NOT NULL,             -- identifica a "rodada" (ex: data/hora da geração), pra agrupar no painel
+    cliente TEXT NOT NULL,
+    telefone_cliente TEXT NOT NULL,
+    responsavel_interno TEXT,
+    processos TEXT,                 -- JSON (lista de números de processo cobertos no rascunho)
+    texto TEXT NOT NULL,
+    criado_em TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_mensagens_telefone ON mensagens(telefone);
 CREATE INDEX IF NOT EXISTS idx_atendimentos_telefone ON atendimentos(telefone);
 CREATE INDEX IF NOT EXISTS idx_atendimentos_processo ON atendimentos(processo);
+CREATE INDEX IF NOT EXISTS idx_rascunhos_lote ON rascunhos_semanais(lote);
 """
 
 
@@ -190,6 +202,62 @@ def listar_atendimentos_recentes(limite=50):
         )
         colunas = [d[0] for d in cur.description]
         return [dict(zip(colunas, linha)) for linha in cur.fetchall()]
+
+
+# -----------------------------------------------------------------------
+# Rascunhos semanais de follow-up (seção adicional: resumo toda sexta,
+# gerado pra pessoa responsável revisar e enviar no grupo do cliente —
+# a IA não manda direto, ver followup_semanal.py)
+# -----------------------------------------------------------------------
+
+def registrar_rascunhos_semanais(rascunhos: list):
+    """`rascunhos` é a lista retornada por followup_semanal.gerar_rascunhos().
+    `lote` identifica essa rodada de geração (ex: timestamp ISO), pra
+    conseguir mostrar no painel só a última rodada."""
+    lote = datetime.now().isoformat(timespec="seconds")
+    with _conexao() as con:
+        for r in rascunhos:
+            con.execute(
+                """INSERT INTO rascunhos_semanais
+                   (lote, cliente, telefone_cliente, responsavel_interno,
+                    processos, texto, criado_em)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    lote, r["cliente"], r["telefone_cliente"],
+                    r.get("responsavel_interno"),
+                    json.dumps(r.get("processos", []), ensure_ascii=False),
+                    r["texto"], lote,
+                ),
+            )
+    return lote
+
+
+def listar_rascunhos_semanais_recentes():
+    """Retorna só os rascunhos do lote mais recente (a última rodada de
+    geração), pra exibir no painel."""
+    with _conexao() as con:
+        ultimo_lote = con.execute(
+            "SELECT lote FROM rascunhos_semanais ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not ultimo_lote:
+            return {"lote": None, "rascunhos": []}
+        lote = ultimo_lote[0]
+        cur = con.execute(
+            """SELECT cliente, telefone_cliente, responsavel_interno, processos, texto
+               FROM rascunhos_semanais WHERE lote = ? ORDER BY cliente""",
+            (lote,),
+        )
+        rascunhos = [
+            {
+                "cliente": cliente,
+                "telefone_cliente": telefone,
+                "responsavel_interno": responsavel,
+                "processos": json.loads(processos) if processos else [],
+                "texto": texto,
+            }
+            for cliente, telefone, responsavel, processos, texto in cur.fetchall()
+        ]
+    return {"lote": lote, "rascunhos": rascunhos}
 
 
 class Cronometro:
