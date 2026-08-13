@@ -142,6 +142,46 @@
     .tiles { grid-template-columns: repeat(2, 1fr); }
     .grid-2 { grid-template-columns: 1fr; }
   }
+
+  .rascunho-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    background: var(--page-plane);
+  }
+  .rascunho-card .cabecalho {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .rascunho-card .cliente-nome { font-weight: 600; font-size: 13.5px; }
+  .rascunho-card .meta { font-size: 11.5px; color: var(--text-muted); }
+  .rascunho-card textarea {
+    width: 100%;
+    min-height: 110px;
+    font-family: inherit;
+    font-size: 12.5px;
+    color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    resize: vertical;
+  }
+  .botao-copiar {
+    margin-top: 6px;
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .botao-copiar:hover { filter: brightness(1.05); }
 </style>
 </head>
 <body>
@@ -170,6 +210,16 @@
     <div class="painel-secao">
       <h2>Atendimentos recentes</h2>
       <div id="tabela-recentes"></div>
+    </div>
+
+    <div class="painel-secao">
+      <h2>Rascunhos do resumo semanal <span id="rascunhos-lote" class="meta"></span></h2>
+      <p class="subtitulo" style="margin-bottom:12px;">
+        Gerado automaticamente toda sexta-feira — um rascunho por cliente, com todos os
+        processos em aberto. A IA não manda essas mensagens (ela não participa de grupos
+        do WhatsApp); revise e cole você mesmo na conversa/grupo do cliente.
+      </p>
+      <div id="lista-rascunhos"></div>
     </div>
   </div>
 
@@ -257,6 +307,38 @@ function renderTabela(recentes) {
   </table>`;
 }
 
+function renderRascunhos(payload) {
+  const loteEl = document.getElementById('rascunhos-lote');
+  const listaEl = document.getElementById('lista-rascunhos');
+
+  if (!payload || !payload.rascunhos || payload.rascunhos.length === 0) {
+    loteEl.textContent = '';
+    listaEl.innerHTML = '<div class="vazio">Ainda não foi gerado nenhum resumo semanal.</div>';
+    return;
+  }
+
+  loteEl.textContent = `· última geração: ${payload.lote}`;
+  listaEl.innerHTML = payload.rascunhos.map((r, idx) => `
+    <div class="rascunho-card">
+      <div class="cabecalho">
+        <span class="cliente-nome">${escapeHtml(r.cliente)}</span>
+        <span class="meta">${escapeHtml(r.responsavel_interno || 'sem responsável definido')} · ${escapeHtml((r.processos || []).join(', '))}</span>
+      </div>
+      <textarea id="rascunho-texto-${idx}" readonly>${escapeHtml(r.texto)}</textarea>
+      <button class="botao-copiar" onclick="copiarRascunho(${idx})">📋 Copiar mensagem</button>
+    </div>`).join('');
+}
+
+function copiarRascunho(idx) {
+  const el = document.getElementById(`rascunho-texto-${idx}`);
+  navigator.clipboard.writeText(el.value).then(() => {
+    const btn = event.target;
+    const original = btn.textContent;
+    btn.textContent = '✅ Copiado!';
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  });
+}
+
 async function carregar() {
   const resp = await fetch('/painel/api/stats');
   const data = await resp.json();
@@ -265,6 +347,9 @@ async function carregar() {
   renderBarras('chart-motivos', data.motivos_encaminhamento, 'motivo', 'quantidade', (idx) => CORES[idx % CORES.length]);
   renderDias(data.atendimentos_por_dia);
   renderTabela(data.recentes);
+
+  const respRascunhos = await fetch('/painel/api/rascunhos-semanais');
+  renderRascunhos(await respRascunhos.json());
 }
 
 carregar();
