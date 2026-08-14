@@ -17,13 +17,40 @@ Fluxo:
 """
 
 import os
+import smtplib
 from datetime import datetime
+from email.message import EmailMessage
 
 import conexos_connector
+import conexos_planilha
 import erp_mock
 
 ERP_BACKEND = os.environ.get("ERP_BACKEND", "mock").strip().lower()
-_erp = conexos_connector if ERP_BACKEND == "conexos" else erp_mock
+if ERP_BACKEND == "conexos":
+    _erp = conexos_connector
+elif ERP_BACKEND == "conexos_planilha":
+    _erp = conexos_planilha
+else:
+    _erp = erp_mock
+
+# -----------------------------------------------------------------------
+# Mapeamento responsável interno -> e-mail.
+#
+# Chaves confirmadas em 14/08/2026 a partir da planilha real exportada do
+# CONEXOS (coluna "Responsável"): "BERNARDO", "ABNERH", "SANTOSTHIAGO".
+# O erp_mock.py também usa esses mesmos nomes agora, pra testar com o
+# mesmo mapeamento que vai valer com dados reais (ver conexos_planilha.py).
+# -----------------------------------------------------------------------
+EMAIL_RESPONSAVEIS = {
+    "BERNARDO": "bernardo.mello@seletocomex.com.br",
+    "ABNERH": "abnerh@seletocomex.com.br",
+    "SANTOSTHIAGO": "santos.thiago@seletocomex.com.br",
+}
+
+EMAIL_SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.office365.com")
+EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+EMAIL_SMTP_USER = os.environ.get("EMAIL_SMTP_USER")  # ex: followup@seletocomex.com.br
+EMAIL_SMTP_PASSWORD = os.environ.get("EMAIL_SMTP_PASSWORD")
 
 
 def _formata_data_br(data_iso):
@@ -39,8 +66,14 @@ def _processo_esta_aberto(processo: dict) -> bool:
     """
     Regra combinada com o Bernardo: o resumo semanal cobre TODOS os
     processos em aberto, sempre (não filtra por "teve mudança na
-    semana"). "Aberto" = ainda não tem entrega efetivada no sistema.
+    semana"). "Aberto" = status do processo diferente de ENCERRADO
+    quando esse campo existe (planilha real do CONEXOS); senão, cai no
+    critério antigo (ainda não tem entrega efetivada no sistema — usado
+    pelo erp_mock.py de teste).
     """
+    status = processo.get("status_processo")
+    if status:
+        return status != "ENCERRADO"
     return not processo["info_entrega"].get("data_efetiva_entrega")
 
 
@@ -113,11 +146,93 @@ def gerar_rascunhos() -> list:
 
     rascunhos = []
     for (cliente, telefone), processos in por_cliente.items():
+        responsavel = processos[0].get("responsavel_interno")
         rascunhos.append({
             "cliente": cliente,
             "telefone_cliente": telefone,
-            "responsavel_interno": processos[0].get("responsavel_interno"),
+            "responsavel_interno": responsavel,
+            "email_responsavel": EMAIL_RESPONSAVEIS.get(responsavel),
             "processos": [p["processo"] for p in processos],
             "texto": montar_rascunho_cliente(cliente, processos),
         })
     return rascunhos
+
+
+# -----------------------------------------------------------------------
+# Envio por e-mail (um e-mail por responsável, com os clientes dele).
+#
+# Não é a IA "mandando pro cliente" — é um aviso interno pra pessoa
+# responsável, que revisa e decide o que enviar em cada grupo/conversa.
+# Sem EMAIL_SMTP_USER/EMAIL_SMTP_PASSWORD configurados, essa função só
+# registra no log e não falha o resto do processo (mesmo padrão do
+# envio de WhatsApp: nunca deixa a geração dos rascunhos quebrar por
+# causa do envio).
+# -----------------------------------------------------------------------
+
+def _agrupar_por_responsavel(rascunhos: list) -> dict:
+    """{"email@...": [rascunho, rascunho, ...]}, ignora quem não tem e-mail mapeado."""
+    por_email = {}
+    for r in rascunhos:
+        email = r.get("email_responsavel")
+        if not email:
+            continue
+        por_email.setdefault(email, []).append(r)
+    return por_email
+
+
+def montar_email_responsavel(rascunhos_do_responsavel: list) -> str:
+    hoje = datetime.now().strftime("%d/%m/%Y")
+    partes = [
+        f"Resumo semanal de follow-up — {hoje}",
+        "",
+        "Segue o status dos seus clientes com processos em aberto. Revise e "
+        "envie a mensagem correspondente no grupo/conversa de cada cliente "
+        "(o texto já vem pronto pra copiar também pelo painel).",
+        "",
+    ]
+    for r in rascunhos_do_responsavel:
+        partes.append("-" * 40)
+        partes.append(r["texto"])
+        partes.append("")
+    partes.append("-" * 40)
+    partes.append("Painel completo: (URL do painel configurada no Render)")
+    return "\n".join(partes)
+
+
+def enviar_emails_responsaveis(rascunhos: list) -> dict:
+    """
+    Manda um e-mail por responsável, agrupando os clientes dele. Retorna
+    um resumo {"enviados": int, "pulados_sem_email": [clientes], "erro": str|None}.
+    """
+    resultado = {"enviados": 0, "pulados_sem_email": [], "erro": None}
+
+    for r in rascunhos:
+        if not r.get("email_responsavel"):
+            resultado["pulados_sem_email"].append(r["cliente"])
+
+    if not EMAIL_SMTP_USER or not EMAIL_SMTP_PASSWORD:
+        print("[EMAIL] EMAIL_SMTP_USER/EMAIL_SMTP_PASSWORD não configurados — pulando envio (rascunhos só ficam no painel).")
+        return resultado
+
+    por_email = _agrupar_por_responsavel(rascunhos)
+    if not por_email:
+        return resultado
+
+    try:
+        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=15) as smtp:
+            smtp.starttls()
+            smtp.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+            for email_destino, rascunhos_pessoa in por_email.items():
+                msg = EmailMessage()
+                msg["Subject"] = f"Resumo semanal de follow-up — {datetime.now().strftime('%d/%m/%Y')}"
+                msg["From"] = EMAIL_SMTP_USER
+                msg["To"] = email_destino
+                msg.set_content(montar_email_responsavel(rascunhos_pessoa))
+                smtp.send_message(msg)
+                resultado["enviados"] += 1
+                print(f"[EMAIL] Resumo semanal enviado para {email_destino} ({len(rascunhos_pessoa)} cliente(s))")
+    except Exception as exc:  # nunca deixa o envio de e-mail quebrar o resto do fluxo
+        resultado["erro"] = str(exc)
+        print(f"[EMAIL ERRO] falha ao enviar resumo semanal: {exc}")
+
+    return resultado
