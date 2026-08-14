@@ -50,10 +50,19 @@ CREATE TABLE IF NOT EXISTS rascunhos_semanais (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lote TEXT NOT NULL,             -- identifica a "rodada" (ex: data/hora da geração), pra agrupar no painel
     cliente TEXT NOT NULL,
-    telefone_cliente TEXT NOT NULL,
+    telefone_cliente TEXT,           -- pode ser NULL (ex: conexos_planilha não tem telefone)
     responsavel_interno TEXT,
     processos TEXT,                 -- JSON (lista de números de processo cobertos no rascunho)
     texto TEXT NOT NULL,
+    criado_em TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execucoes_diarias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lote TEXT NOT NULL,
+    enviados INTEGER NOT NULL,
+    detalhe TEXT,                   -- JSON (contagem por destinatário/grupo)
+    erro TEXT,
     criado_em TEXT NOT NULL
 );
 
@@ -74,9 +83,45 @@ def _conexao():
         con.close()
 
 
+def _migrar_telefone_cliente_opcional(con):
+    """Bancos criados antes de 14/08 têm `telefone_cliente NOT NULL` em
+    rascunhos_semanais. Isso quebra com o conector conexos_planilha, que
+    não tem telefone do cliente. Recria a tabela permitindo NULL,
+    preservando os dados existentes."""
+    cur = con.execute("PRAGMA table_info(rascunhos_semanais)")
+    colunas = cur.fetchall()
+    if not colunas:
+        return  # tabela ainda não existe — o CREATE TABLE normal já cobre isso
+    precisa_migrar = any(nome == "telefone_cliente" and notnull for _, nome, _, notnull, _, _ in colunas)
+    if not precisa_migrar:
+        return
+
+    con.execute("ALTER TABLE rascunhos_semanais RENAME TO rascunhos_semanais_old")
+    con.execute("""
+        CREATE TABLE rascunhos_semanais (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lote TEXT NOT NULL,
+            cliente TEXT NOT NULL,
+            telefone_cliente TEXT,
+            responsavel_interno TEXT,
+            processos TEXT,
+            texto TEXT NOT NULL,
+            criado_em TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        INSERT INTO rascunhos_semanais
+            (id, lote, cliente, telefone_cliente, responsavel_interno, processos, texto, criado_em)
+        SELECT id, lote, cliente, telefone_cliente, responsavel_interno, processos, texto, criado_em
+        FROM rascunhos_semanais_old
+    """)
+    con.execute("DROP TABLE rascunhos_semanais_old")
+
+
 def inicializar():
     with _conexao() as con:
         con.executescript(_SCHEMA)
+        _migrar_telefone_cliente_opcional(con)
 
 
 def registrar_mensagem(telefone: str, papel: str, texto: str):
@@ -258,6 +303,48 @@ def listar_rascunhos_semanais_recentes():
             for cliente, telefone, responsavel, processos, texto in cur.fetchall()
         ]
     return {"lote": lote, "rascunhos": rascunhos}
+
+
+# -----------------------------------------------------------------------
+# Execuções diárias do acompanhamento por status (ver followup_diario.py)
+# -----------------------------------------------------------------------
+
+def registrar_execucao_diaria(resultado: dict) -> str:
+    """`resultado` é o dict retornado por followup_diario.executar_followup_diario()."""
+    lote = datetime.now().isoformat(timespec="seconds")
+    with _conexao() as con:
+        con.execute(
+            """INSERT INTO execucoes_diarias (lote, enviados, detalhe, erro, criado_em)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                lote,
+                resultado.get("enviados", 0),
+                json.dumps(resultado.get("detalhe", {}), ensure_ascii=False),
+                resultado.get("erro"),
+                lote,
+            ),
+        )
+    return lote
+
+
+def listar_execucoes_diarias_recentes(limite: int = 10):
+    with _conexao() as con:
+        cur = con.execute(
+            """SELECT lote, enviados, detalhe, erro, criado_em
+               FROM execucoes_diarias ORDER BY id DESC LIMIT ?""",
+            (limite,),
+        )
+        linhas = cur.fetchall()
+    return [
+        {
+            "lote": lote,
+            "enviados": enviados,
+            "detalhe": json.loads(detalhe) if detalhe else {},
+            "erro": erro,
+            "criado_em": criado_em,
+        }
+        for lote, enviados, detalhe, erro, criado_em in linhas
+    ]
 
 
 class Cronometro:
