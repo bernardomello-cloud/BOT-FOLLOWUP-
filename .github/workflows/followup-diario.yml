@@ -1,0 +1,31 @@
+name: Followup diario (por status)
+
+# Dispara o acompanhamento diário por status (POST /cron/followup-diario)
+# de segunda a sexta. Manda e-mails internos: responsável do processo
+# (AGDO EMBARQUE / EM TRÂNSITO), Fernando (AGDO PRESENÇA DE CARGA / AGDO
+# CARREGAMENTO / EM DESEMBARAÇO) e fiscal/financeiro (AGDO FECHAMENTO).
+# Veja followup_diario.py e app.py para o que esse endpoint faz.
+
+on:
+  schedule:
+    # 11:00 UTC = 08:00 no horário de Brasília, de segunda (1) a sexta (5).
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch: {}   # permite disparar manualmente pelo botão "Run workflow" no GitHub
+
+jobs:
+  disparar-followup-diario:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chamar endpoint do acompanhamento diário
+        run: |
+          resposta=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://bot-follow-up.onrender.com/cron/followup-diario" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}")
+          codigo=$(echo "$resposta" | tail -n1)
+          corpo=$(echo "$resposta" | sed '$d')
+          echo "HTTP $codigo"
+          echo "$corpo"
+          if [ "$codigo" != "200" ]; then
+            echo "Falha no acompanhamento diário (HTTP $codigo)"
+            exit 1
+          fi
