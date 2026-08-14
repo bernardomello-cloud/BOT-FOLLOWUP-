@@ -221,6 +221,17 @@
       </p>
       <div id="lista-rascunhos"></div>
     </div>
+
+    <div class="painel-secao">
+      <h2>Acompanhamento diário por status</h2>
+      <p class="subtitulo" style="margin-bottom:12px;">
+        Roda todo dia útil: e-mail por responsável (AGDO EMBARQUE / EM TRÂNSITO),
+        para o Fernando (AGDO PRESENÇA DE CARGA / AGDO CARREGAMENTO / EM DESEMBARAÇO)
+        e para o fiscal/financeiro — shayane e Joabe (AGDO FECHAMENTO).
+        Últimas execuções:
+      </p>
+      <div id="tabela-execucoes-diarias"></div>
+    </div>
   </div>
 
 <script>
@@ -339,6 +350,35 @@ function copiarRascunho(idx) {
   });
 }
 
+function renderExecucoesDiarias(execucoes) {
+  const el = document.getElementById('tabela-execucoes-diarias');
+  if (!execucoes || execucoes.length === 0) {
+    el.innerHTML = '<div class="vazio">Ainda não rodou nenhuma vez.</div>';
+    return;
+  }
+  const linhas = execucoes.map(e => {
+    const d = e.detalhe || {};
+    const responsaveis = Object.entries(d.responsaveis || {})
+      .map(([email, qtd]) => `${email}: ${qtd}`).join(', ') || '—';
+    const partes = [
+      `responsáveis (${responsaveis})`,
+      `Fernando: ${d.fernando ?? 0}`,
+      `fiscal/financeiro: ${d.fiscal_financeiro ?? 0}`,
+    ].join(' · ');
+    return `
+      <tr>
+        <td>${escapeHtml(e.criado_em)}</td>
+        <td class="destaque">${e.enviados}</td>
+        <td>${escapeHtml(partes)}</td>
+        <td>${e.erro ? `<span class="badge sim">${escapeHtml(e.erro)}</span>` : '<span class="badge nao">ok</span>'}</td>
+      </tr>`;
+  }).join('');
+  el.innerHTML = `<table>
+    <thead><tr><th>Quando</th><th>E-mails enviados</th><th>Detalhe</th><th>Status</th></tr></thead>
+    <tbody>${linhas}</tbody>
+  </table>`;
+}
+
 async function carregar() {
   const resp = await fetch('/painel/api/stats');
   const data = await resp.json();
@@ -350,6 +390,9 @@ async function carregar() {
 
   const respRascunhos = await fetch('/painel/api/rascunhos-semanais');
   renderRascunhos(await respRascunhos.json());
+
+  const respDiario = await fetch('/painel/api/execucoes-diarias');
+  renderExecucoesDiarias(await respDiario.json());
 }
 
 carregar();
